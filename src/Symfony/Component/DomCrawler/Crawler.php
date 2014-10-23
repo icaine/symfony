@@ -28,6 +28,21 @@ class Crawler extends \SplObjectStorage
     protected $uri;
 
     /**
+     * @var Crawler
+     */
+    protected $parentCrawler;
+
+    /**
+     * @var \DOMXPath
+     */
+    protected $domXPath;
+
+    /**
+     * @var array
+     */
+    protected $cssToXPathCache = array();
+
+    /**
      * @var string The default namespace prefix to be used with XPath and CSS expressions
      */
     private $defaultNamespacePrefix = 'default';
@@ -45,9 +60,10 @@ class Crawler extends \SplObjectStorage
      *
      * @api
      */
-    public function __construct($node = null, $uri = null)
+    public function __construct($node = null, $uri = null, Crawler $parentCrawler = null)
     {
         $this->uri = $uri;
+        $this->parentCrawler = $parentCrawler;
 
         $this->add($node);
     }
@@ -308,11 +324,11 @@ class Crawler extends \SplObjectStorage
     {
         foreach ($this as $i => $node) {
             if ($i == $position) {
-                return new static($node, $this->uri);
+                return $this->createCrawler($node, $this->uri);
             }
         }
 
-        return new static(null, $this->uri);
+        return $this->createCrawler(null, $this->uri);
     }
 
     /**
@@ -337,7 +353,7 @@ class Crawler extends \SplObjectStorage
     {
         $data = array();
         foreach ($this as $i => $node) {
-            $data[] = $closure(new static($node, $this->uri), $i);
+            $data[] = $closure($this->createCrawler($node, $this->uri), $i);
         }
 
         return $data;
@@ -353,7 +369,7 @@ class Crawler extends \SplObjectStorage
      */
     public function slice($offset = 0, $length = -1)
     {
-        return new static(iterator_to_array(new \LimitIterator($this, $offset, $length)), $this->uri);
+        return $this->createCrawler(iterator_to_array(new \LimitIterator($this, $offset, $length)), $this->uri);
     }
 
     /**
@@ -371,12 +387,12 @@ class Crawler extends \SplObjectStorage
     {
         $nodes = array();
         foreach ($this as $i => $node) {
-            if (false !== $closure(new static($node, $this->uri), $i)) {
+            if (false !== $closure($this->createCrawler($node, $this->uri), $i)) {
                 $nodes[] = $node;
             }
         }
 
-        return new static($nodes, $this->uri);
+        return $this->createCrawler($nodes, $this->uri);
     }
 
     /**
@@ -418,7 +434,7 @@ class Crawler extends \SplObjectStorage
             throw new \InvalidArgumentException('The current node list is empty.');
         }
 
-        return new static($this->sibling($this->getNode(0)->parentNode->firstChild), $this->uri);
+        return $this->createCrawler($this->sibling($this->getNode(0)->parentNode->firstChild), $this->uri);
     }
 
     /**
@@ -436,7 +452,7 @@ class Crawler extends \SplObjectStorage
             throw new \InvalidArgumentException('The current node list is empty.');
         }
 
-        return new static($this->sibling($this->getNode(0)), $this->uri);
+        return $this->createCrawler($this->sibling($this->getNode(0)), $this->uri);
     }
 
     /**
@@ -454,7 +470,7 @@ class Crawler extends \SplObjectStorage
             throw new \InvalidArgumentException('The current node list is empty.');
         }
 
-        return new static($this->sibling($this->getNode(0), 'previousSibling'), $this->uri);
+        return $this->createCrawler($this->sibling($this->getNode(0), 'previousSibling'), $this->uri);
     }
 
     /**
@@ -481,7 +497,7 @@ class Crawler extends \SplObjectStorage
             }
         }
 
-        return new static($nodes, $this->uri);
+        return $this->createCrawler($nodes, $this->uri);
     }
 
     /**
@@ -501,7 +517,7 @@ class Crawler extends \SplObjectStorage
 
         $node = $this->getNode(0)->firstChild;
 
-        return new static($node ? $this->sibling($node) : array(), $this->uri);
+        return $this->createCrawler($node ? $this->sibling($node) : array(), $this->uri);
     }
 
     /**
@@ -646,7 +662,7 @@ class Crawler extends \SplObjectStorage
 
         // If we dropped all expressions in the XPath while preparing it, there would be no match
         if ('' === $xpath) {
-            return new static(null, $this->uri);
+            return $this->createCrawler(null, $this->uri);
         }
 
         return $this->filterRelativeXPath($xpath);
@@ -672,7 +688,11 @@ class Crawler extends \SplObjectStorage
         }
 
         // The CssSelector already prefixes the selector with descendant-or-self::
-        return $this->filterRelativeXPath(CssSelector::toXPath($selector));
+        $root = $this->getRootCrawler();
+        if (empty($root->cssToXPathCache[$selector])) {
+            $root->cssToXPathCache[$selector] = CssSelector::toXPath($selector);
+        }
+        return $this->filterRelativeXPath($root->cssToXPathCache[$selector]);
     }
 
     /**
@@ -855,8 +875,7 @@ class Crawler extends \SplObjectStorage
     private function filterRelativeXPath($xpath)
     {
         $prefixes = $this->findNamespacePrefixes($xpath);
-
-        $crawler = new static(null, $this->uri);
+        $crawler = $this->createCrawler(null, $this->uri);
 
         foreach ($this as $node) {
             $domxpath = $this->createDOMXPath($node->ownerDocument, $prefixes);
@@ -979,13 +998,16 @@ class Crawler extends \SplObjectStorage
      */
     private function createDOMXPath(\DOMDocument $document, array $prefixes = array())
     {
-        $domxpath = new \DOMXPath($document);
-
-        foreach ($prefixes as $prefix) {
-            $namespace = $this->discoverNamespace($domxpath, $prefix);
-            if (null !== $namespace) {
-                $domxpath->registerNamespace($prefix, $namespace);
+        $domxpath = $this->getRootCrawler()->domXPath;
+        if (empty($domxpath)) {
+            $domxpath = new \DOMXPath($document);
+            foreach ($prefixes as $prefix) {
+                $namespace = $this->discoverNamespace($domxpath, $prefix);
+                if (null !== $namespace) {
+                    $domxpath->registerNamespace($prefix, $namespace);
+                }
             }
+            $this->getRootCrawler()->domXPath = $domxpath;
         }
 
         return $domxpath;
@@ -1026,4 +1048,27 @@ class Crawler extends \SplObjectStorage
 
         return array();
     }
+
+    /**
+     * @param mixed $node
+     * @param string $uri
+     * @return Crawler
+     */
+    protected function createCrawler($node = null, $uri = null)
+    {
+        return new static($node, $uri, $this);
+    }
+
+    /**
+     * @return Crawler
+     */
+    protected function getRootCrawler()
+    {
+        $root = $parent = $this;
+        while ($parent = $parent->parentCrawler) {
+            $root = $parent;
+        }
+        return $root;
+    }
+
 }
